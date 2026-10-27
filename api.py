@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 
 app = FastAPI(
     title="API Extractor de Facturas",
@@ -30,6 +30,7 @@ def health():
 @app.post("/extraer-factura")
 async def extraer_factura(
     file: UploadFile = File(...),
+    ocr: bool = Form(default=False),
     x_api_key: str | None = Header(default=None)
 ):
     if not API_KEY or not x_api_key or not hmac.compare_digest(
@@ -79,13 +80,16 @@ async def extraer_factura(
                 detail="El archivo no parece un PDF valido"
             )
 
+        comando = [sys.executable, str(SCRIPT), ruta]
+        if ocr:
+            # Requiere ESCRIBA_URL y una API key válida para el servicio OCR.
+            comando.extend(["--api", "--ocr"])
+        else:
+            # Mantiene el modo local actual cuando no se solicita OCR.
+            comando.append("--local")
+
         resultado = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                ruta,
-                "--local"
-            ],
+            comando,
             cwd=str(BASE_DIR),
             capture_output=True,
             text=True,
