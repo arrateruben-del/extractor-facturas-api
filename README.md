@@ -27,6 +27,18 @@ POST /extraer-factura: recibe un PDF mediante multipart/form-data, campo file.
 
 El endpoint de extracción requiere el encabezado X-API-Key.
 
+## OCR para facturas con diseños no estándar
+
+El endpoint `POST /extraer-factura` acepta el campo multipart opcional `ocr=true`.
+Sin ese campo (o con `false`), conserva la extracción local actual. Con `true`,
+solicita OCR al servicio Escriba configurado en `ESCRIBA_URL` y devuelve los
+campos detectados junto con `meta.ocr_applied`.
+
+Para usarlo, la API debe poder acceder a Escriba y tener configurada
+`ESCRIBA_API_KEY` (o `ESCRIBA_ENV_FILE` apuntando a un archivo que contenga
+`API_TOKEN`). Si el servicio no está disponible o la credencial no es válida,
+la solicitud con OCR falla; no se sustituye silenciosamente por la lectura local.
+
 ## Seguridad
 
 No publicar archivos .env, claves privadas ni documentos fiscales.
