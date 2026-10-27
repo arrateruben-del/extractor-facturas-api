@@ -211,8 +211,9 @@ ETIQUETAS = [
     ("domicilio", r"domicilio comercial|domicilio fiscal|domicilio"),
     ("cond_venta", r"condicion de venta|cond\.? de venta"),
     ("cond_iva", r"condicion (?:frente al|ante el|ante|de) i\.?v\.?a\.?|cond\.? (?:frente al )?i\.?v\.?a\.?|"
-                 r"responsabilidad (?:frente al )?iva"),
-    ("inicio_act", r"fecha de inicio de actividad(?:es)?|inicio de actividad(?:es)?|inicio act\.?"),
+                 r"responsabilidad (?:frente al )?iva|i\.?v\.?a\.?\s+(?:responsable(?:\s+inscripto)?|"
+                 r"monotributo|exento|consumidor final|no responsable)"),
+    ("inicio_act", r"fecha de inicio de actividad(?:es)?|inicio de actividad(?:es)?|inicio de act(?:ividad(?:es)?)?\.?"),
     ("ingresos_brutos", r"ingresos brutos|ing\.? brutos|ii\.?\s?bb\.?|iibb"),
     ("fecha_vto_cae", rf"fecha de vto\.? de(?:l)? {_C}|fecha (?:de )?venc(?:imiento|\.)? (?:de(?:l)? )?{_C}|"
                       rf"vto\.? (?:de(?:l)? )?{_C}|vencimiento (?:de(?:l)? )?{_C}"),
@@ -229,12 +230,12 @@ ETIQUETAS = [
     ("dni", r"d\.?n\.?i\.?(?:\s*n(?:ro|°|o)\.?)?|documento"),
     ("moneda", r"moneda"),
     ("neto_no_gravado", r"importe neto no gravado|neto no gravado"),
-    ("neto", r"importe neto gravado|neto gravado|importe neto|subtotal(?!\s*c/)"),
+    ("neto", r"importe neto gravado|neto gravado|importe neto|sub[\s-]*total(?!\s*c/)"),
     ("iva_alic", r"i\.?v\.?a\.?\s*\d{1,2}(?:[.,]\d{1,2})?\s*%"),
-    ("iva_total", r"(?:importe |total )?i\.?v\.?a\.?(?:\s+inscripto)?(?=\s*:)"),
+    ("iva_total", r"(?:(?:importe(?:\s+de)?|total)\s+)?i\.?v\.?a\.?(?:\s+inscripto)?(?=\s*:|\s|$)"),
     ("otros_tributos", r"importe otros tributos|otros tributos"),
     ("exento", r"importe exento"),
-    ("total", r"importe total|total(?=\s*:)|total a pagar"),
+    ("total", r"importe total|total(?:\s+de)? factura|total(?=\s*:)|total a pagar"),
 ]
 _RE_ETIQ = re.compile(
     "|".join(f"(?P<{k}>(?<![a-z0-9«_]){p}(?![a-z_»]))" for k, p in ETIQUETAS))
