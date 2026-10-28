@@ -8,10 +8,11 @@ import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
+from fastapi.responses import Response
 
 app = FastAPI(
     title="API Extractor de Facturas",
-    version="1.0.0",
+    version="1.1.0",
     docs_url=None,
     redoc_url=None
 )
@@ -126,3 +127,70 @@ async def extraer_factura(
 
         if ruta and os.path.exists(ruta):
             os.remove(ruta)
+
+
+@app.post("/pdf-a-imagen")
+async def pdf_a_imagen(
+    file: UploadFile = File(...),
+    x_api_key: str | None = Header(default=None),
+):
+    """Devuelve la primera pagina del PDF como PNG para lectura visual en n8n.
+
+    Autenticacion y limite de tamano compatibles con /extraer-factura.
+    """
+    if not API_KEY or not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(status_code=401, detail="API Key invalida")
+
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Solo se aceptan archivos PDF")
+
+    try:
+        contenido = bytearray()
+        while bloque := await file.read(1024 * 1024):
+            contenido.extend(bloque)
+            if len(contenido) > MAX_BYTES:
+                raise HTTPException(status_code=413, detail="PDF demasiado grande")
+
+        if not contenido.startswith(b"%PDF-"):
+            raise HTTPException(status_code=400, detail="El archivo no parece un PDF valido")
+
+        try:
+            import pymupdf
+        except ImportError:
+            raise HTTPException(status_code=500, detail="PyMuPDF no esta instalado")
+
+        try:
+            with pymupdf.open(stream=bytes(contenido), filetype="pdf") as documento:
+                if documento.page_count < 1:
+                    raise HTTPException(status_code=422, detail="El PDF no contiene paginas")
+                if documento.needs_pass:
+                    raise HTTPException(status_code=422, detail="El PDF tiene contrasena")
+
+                pagina = documento[0]
+                ancho = float(pagina.rect.width)
+                alto = float(pagina.rect.height)
+                if ancho <= 0 or alto <= 0:
+                    raise HTTPException(status_code=422, detail="Pagina PDF sin dimensiones validas")
+
+                # Se busca ~2x de resolucion sin superar dimensiones ni 8 MP.
+                escala = min(2.0, 2400 / ancho, 3000 / alto,
+                             (8_000_000 / (ancho * alto)) ** 0.5)
+                imagen = pagina.get_pixmap(
+                    matrix=pymupdf.Matrix(escala, escala),
+                    colorspace=pymupdf.csRGB,
+                    alpha=False,
+                )
+                png = imagen.tobytes("png")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # No exponer detalles del PDF ni rutas internas al cliente.
+            raise HTTPException(status_code=422, detail="No se pudo convertir el PDF a imagen") from exc
+
+        return Response(
+            content=png,
+            media_type="image/png",
+            headers={"Cache-Control": "no-store"},
+        )
+    finally:
+        await file.close()

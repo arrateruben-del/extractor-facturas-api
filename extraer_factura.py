@@ -699,6 +699,138 @@ def procesar(pdf: bytes, nombre: str, modo: str, url: str, timeout: int, ocr: bo
     if not meta["advertencias"]:
         del meta["advertencias"]
     salida["meta"] = meta
+    if meta.get("modo_usado") == "local":
+        salida = refinar_con_geometria(pdf, salida)
+    return salida
+
+
+
+# ============================================================================
+# Refinamiento geométrico de comprobantes (versión 1.1)
+# Mantiene la salida pública anterior; nunca inventa valores ilegibles.
+# ============================================================================
+def refinar_con_geometria(pdf: bytes, salida: dict) -> dict:
+    """Contrasta los campos críticos contra sus posiciones en el PDF original.
+
+    Si un identificador es ambiguo, preserva evidencia y deja el campo en None.
+    No usa OCR: encabezados dibujados como imagen requieren auditoría visual.
+    """
+    try:
+        import pymupdf
+        doc = pymupdf.open(stream=pdf, filetype="pdf")
+    except Exception as exc:
+        salida.setdefault("meta", {}).setdefault("advertencias", []).append(
+            f"No se pudo efectuar control geométrico: {type(exc).__name__}")
+        return salida
+
+    incidencias = []
+    evidencia = {}
+    try:
+        if not doc.page_count:
+            return salida
+        p = doc[0]
+        w, h = p.rect.width, p.rect.height
+        words = p.get_text("words")
+        if not words:
+            return salida
+
+        # Filas visuales a partir del centro vertical de cada palabra.
+        rows = []
+        for word in sorted(words, key=lambda z: ((z[1] + z[3]) / 2, z[0])):
+            mid = (word[1] + word[3]) / 2
+            match = next((r for r in reversed(rows[-5:]) if abs(r["mid"] - mid) < 3.1), None)
+            if match is None:
+                match = {"mid": mid, "words": []}
+                rows.append(match)
+            match["words"].append(word)
+        rows.sort(key=lambda r: r["mid"])
+
+        def row_text(row):
+            return " ".join(z[4] for z in sorted(row["words"], key=lambda z:z[0]))
+
+        # Encabezado fiscal (primera franja del documento). Excluye cartas de porte.
+        encabezados = []
+        for row in rows:
+            if row["mid"] > h * .095:
+                break
+            line = row_text(row)
+            m = re.search(r"(?:N[º°o]\.?\s*)?(\d{4,5})\s+(\d{8})\b", line, re.I)
+            if m and ("factura" in line.lower() or "nº" in line.lower() or "n°" in line.lower()) and any(z[0] > w * .67 for z in row["words"]):
+                encabezados.append((m.group(1), m.group(2), line))
+        if len({(a,b) for a,b,_ in encabezados}) == 1:
+            pv, nro, line = encabezados[0]
+            evidencia["numero_factura_encabezado"] = line
+            anterior = (salida.get("punto_venta"), salida.get("numero_comprobante"))
+            if anterior != (pv,nro):
+                incidencias.append("Numeración preliminar reemplazada por la del encabezado fiscal")
+            salida["punto_venta"] = pv.zfill(5)
+            salida["numero_comprobante"] = nro.zfill(8)
+            salida["comprobante"] = f"{pv.zfill(5)}-{nro.zfill(8)}"
+        elif len(encabezados) > 1:
+            incidencias.append("Se detectaron múltiples numeraciones en encabezado: revisar")
+
+        # Cliente/Señor(es), recuperando el valor a la derecha en la misma fila.
+        for row in rows:
+            if row["mid"] > h * .50:
+                break
+            line = row_text(row)
+            m = re.search(r"Señor\(es\)\s*:\s*(.+)",line,re.I)
+            if m:
+                etiqueta = next((z for z in row["words"] if "Señor" in z[4]), None)
+                if etiqueta:
+                    candidatos = [z for z in row["words"]
+                                  if z[0] > etiqueta[2] and z[0] < w*.65]
+                    razon = " ".join(z[4] for z in sorted(candidatos,key=lambda z:z[0])).strip()
+                    if razon:
+                        salida.setdefault("receptor", {})["razon_social"] = razon
+                        evidencia["receptor_seccion_senores"] = razon
+                break
+
+        # Domicilio del receptor: "Domicilio Postal" aparece bajo Señor(es).
+        for row in rows:
+            line = row_text(row)
+            if re.search(r"Domicilio\s+Postal", line, re.I):
+                candidatos = [z for z in row["words"] if w*.155 < z[0] < w*.66]
+                direccion = " ".join(z[4] for z in sorted(candidatos,key=lambda z:z[0])).strip()
+                if direccion:
+                    salida.setdefault("receptor", {})["domicilio"] = direccion
+                    evidencia["receptor_domicilio"] = direccion
+                break
+        if re.search(r"(?i)Postal:", str(salida.get("emisor", {}).get("domicilio") or "")):
+            salida["emisor"]["domicilio"] = None
+        # Ceros de control no constituyen DNI cuando ya hay CUIT del receptor.
+        if salida.get("receptor",{}).get("cuit"):
+            salida["receptor"]["dni"] = None
+
+        # La razón social del emisor no puede inferirse del nombre del receptor.
+        # Si el encabezado del emisor no tiene texto digital, dejar null.
+        left_header = [z[4] for z in words if z[0] < w*.46 and z[1] < h*.12]
+        if not left_header and salida.get("emisor", {}).get("razon_social"):
+            salida["emisor"]["razon_social"] = None
+            incidencias.append("Razón social del emisor solo visible en imagen del encabezado; requiere lectura visual")
+        elif not left_header:
+            incidencias.append("Encabezado gráfico sin texto digital: razón social del emisor pendiente de lectura visual")
+
+        # CAE: capturar secuencia completa, nunca truncar a 14 posiciones.
+        candidates = []
+        for row in rows:
+            line = row_text(row)
+            for m in re.finditer(r"\bCAE\s*(?:N[º°o]\s*)?[:]?\s*(\d{14,22})\b",line,re.I):
+                candidates.append(m.group(1))
+        if candidates:
+            valores = list(dict.fromkeys(candidates))
+            evidencia["cae_literal"] = valores
+            if len(valores)==1 and len(valores[0])==14:
+                salida["cae"] = valores[0]
+            else:
+                salida["cae"] = None
+                incidencias.append("CAE con longitud no habitual o múltiples candidatos; revisar el original")
+
+        salida["evidencias_geometricas"] = evidencia
+        if incidencias:
+            salida.setdefault("meta", {}).setdefault("advertencias", []).extend(incidencias)
+    finally:
+        doc.close()
     return salida
 
 
