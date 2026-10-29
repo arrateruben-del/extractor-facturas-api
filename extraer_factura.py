@@ -875,6 +875,7 @@ def parsear_campos(texto: str) -> dict:
         total = vals[-1]
         iva_m = vals[-3] if len(vals) >= 6 else vals[-2]
         neto = vals[-4] if len(vals) >= 6 else vals[-3]
+        no_gravado = vals[-5] if len(vals) >= 6 else None
         alic = vals[-2] if len(vals) >= 6 else None
         if neto and iva_m and total and total > neto and total >= iva_m:
             res["importe_neto"], res["importe_neto_original"] = neto, nums[-4] if len(nums) >= 6 else nums[-3]
@@ -882,8 +883,24 @@ def parsear_campos(texto: str) -> dict:
             res["importe_total"], res["importe_total_original"] = total, nums[-1]
             if alic is not None and 0 < alic <= 100:
                 res["iva_detalle"] = [{"alicuota": alic, "monto": iva_m, "original": f"IVA {alic:.2f}%"}]
-            dif = round(total - neto - iva_m, 2)
-            res["otros_tributos"] = 0.0 if abs(dif) < 0.01 else dif
+
+            # En este layout el concepto IMP./NO GRAVADO se reporta como otros_tributos
+            if no_gravado is not None:
+                res["otros_tributos"] = no_gravado
+            else:
+                dif = round(total - neto - iva_m, 2)
+                res["otros_tributos"] = 0.0 if abs(dif) < 0.01 else dif
+
+            m_itc = re.search(r"(?im)^\s*\.?\s*t\.?\s*c\.?\s*:\s*(\d{1,3}(?:\.\d{3})*,\d{2})", texto)
+            m_gasoil = re.search(r"(?im)^\s*tasa\s+gas\s*oil\s*:\s*(\d{1,3}(?:\.\d{3})*,\d{2})", texto)
+            detalle_trib = {}
+            if m_itc:
+                detalle_trib["I.T.C."] = parse_monto(m_itc.group(1))
+            if m_gasoil:
+                detalle_trib["Tasa Gas Oil"] = parse_monto(m_gasoil.group(1))
+            if detalle_trib:
+                res["otros_tributos_detalle"] = [detalle_trib]
+
             break
 
     if not res.get("moneda") and ("$" in texto or re.search(r"(?i)\bpesos\b", texto)):
