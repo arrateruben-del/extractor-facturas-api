@@ -472,10 +472,21 @@ def detectar_tipo(texto: str) -> dict:
                 clase = nombre
                 break
     if not letra:
-        m = (re.search(r"(?:factura|nota de (?:credito|debito)|recibo)\s+(?:tipo\s+)?[\"'“]?([abcem])(?![a-z0-9])", pl)
-             or re.search(r"^\s*([abcem])\s*$", pl, re.M))
+        m = (
+            re.search(r"(?:factura|nota de (?:credito|debito)|recibo)\s+(?:tipo\s+)?[\"'“]?([abcem])(?![a-z0-9])", pl)
+            or re.search(r"\b([abcem])\s+\d{0,3}\s*(?:factura|nota de (?:credito|debito)|recibo)\b", pl)
+            or re.search(r"^\s*([abcem])\s*$", pl, re.M)
+        )
         if m:
             letra = m.group(1).upper()
+
+    # Fallback: inferir código AFIP cuando hay clase+letra pero no vino explícito Cód.xxx
+    if not codigo and clase and letra:
+        for cod, (c, l) in CODIGOS_AFIP.items():
+            if c == clase and l == letra:
+                codigo = cod
+                break
+
     tipo = f"{clase} {letra}" if clase and letra else clase
     return {"tipo_comprobante": tipo, "clase": clase, "letra": letra,
             "codigo_tipo": codigo, "codigo_tipo_original": cod_orig}
