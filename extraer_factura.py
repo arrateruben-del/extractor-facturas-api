@@ -932,6 +932,23 @@ def _completar(base: dict, extra: dict) -> dict:
     return base
 
 
+def _normalizar_domicilio_postal(dom: str | None) -> str | None:
+    """Unifica el domicilio al formato 'NN NNNN - NNNN LOCALIDAD' (con guion).
+
+    Se aplica por igual en modo API (Escriba) y en modo local, de modo que ambos
+    caminos devuelvan el mismo valor. Si el string no encaja con el patrón postal,
+    se devuelve tal cual.
+    """
+    if not dom:
+        return dom
+    dom = " ".join(str(dom).split())
+    m_postal = re.match(
+        r"^(\d{2})\s*(\d{3,4})\s+(\d{4}\s+[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ ]+)$", dom, re.I)
+    if m_postal:
+        return f"{m_postal.group(1)} {m_postal.group(2)} - {m_postal.group(3)}"
+    return dom
+
+
 def _normalizar_receptor(campos: dict) -> dict:
     rec = campos.get("receptor")
     if not isinstance(rec, dict):
@@ -942,6 +959,8 @@ def _normalizar_receptor(campos: dict) -> dict:
     if tipo == "DNI":
         rec["cuit"] = None
         rec["cuit_valido"] = None
+    if rec.get("domicilio"):
+        rec["domicilio"] = _normalizar_domicilio_postal(rec["domicilio"])
     return campos
 
 
