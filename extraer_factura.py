@@ -950,8 +950,18 @@ def _layout_subtotal_percepciones(texto: str, res: dict) -> None:
                 emi["razon_social"] = cand
                 break
 
-    # --- Domicilio emisor: este layout no lo muestra visualmente (sólo logo) ---
+    # --- Domicilio emisor: viene oculto en la capa de texto (no visible / no OCR):
+    #     "<RAZÓN SOCIAL>" / "AV. 59 NRO. 3210  Fecha de Emisión..." / "COD.01" / "NECOCHEA"
     emi["domicilio"] = None
+    rs_emi = emi.get("razon_social") or ""
+    idx_rs = next((i for i, l in enumerate(lineas[:12]) if rs_emi and l == rs_emi), None)
+    if idx_rs is not None:
+        sig = [l for l in lineas[idx_rs + 1:idx_rs + 6] if l]
+        calle = re.split(r"(?i)\s*fecha de emisi", sig[0])[0].strip() if sig else ""
+        if calle and _parece_domicilio_linea(calle) and re.search(r"\d", calle):
+            loc = next((l for l in sig[1:4] if re.fullmatch(r"[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ .]{2,40}", l)
+                        and not re.match(r"(?i)cod\.?\s*\d", l) and not re.match(r"(?i)factura", l)), None)
+            emi["domicilio"] = f"{calle} - {loc}" if loc else calle
 
     # --- Condición IVA "RESPONSABLE" partida en dos renglones ---
     hay_ri = bool(re.search(r"(?i)responsable\s*\n?\s*inscripto", texto))
@@ -1017,9 +1027,8 @@ def _layout_subtotal_percepciones(texto: str, res: dict) -> None:
         res["iva"], res["iva_original"] = p["iva"], v["iva"]
         res["importe_total"], res["importe_total_original"] = p["total"], v["total"]
         res["otros_tributos_detalle"] = [{"I.T.C.": p["itc"], "Tasa Gas Oil": p["tasas"]}]
-        if None not in (p["total"], p["sub"], p["iva"]):
-            res["otros_tributos"] = round(p["total"] - p["sub"] - p["iva"], 2)
-        elif None not in (p["perc"], p["itc"], p["tasas"], p["vial"]):
+        # Sin "Otros Tributos" explícito: Percepciones + ITC + Tasas + Tasa Vial
+        if None not in (p["perc"], p["itc"], p["tasas"], p["vial"]):
             res["otros_tributos"] = round(p["perc"] + p["itc"] + p["tasas"] + p["vial"], 2)
         else:
             res["otros_tributos"] = None
@@ -1127,6 +1136,16 @@ def _completar_montos_desde_capa_texto(campos: dict, pdf: bytes, meta: dict) -> 
                 if v is None and dl.get(k) is not None:
                     d[k] = dl[k]
                     usados.append(f"otros_tributos_detalle.{k}")
+    # Datos que el PDF trae en la capa de texto pero no son visibles para el OCR
+    emi, emi_loc = campos.setdefault("emisor", {}), extra.get("emisor") or {}
+    if not emi.get("domicilio") and emi_loc.get("domicilio") and \
+            _RE_HDR_TOT_PERC.search(loc.get("layout") or loc["texto"]):
+        emi["domicilio"] = emi_loc["domicilio"]
+        usados.append("emisor.domicilio")
+    rs, rs_loc = emi.get("razon_social") or "", emi_loc.get("razon_social") or ""
+    if rs and rs_loc and rs_loc != rs and plegar(rs_loc).startswith(plegar(rs)):
+        emi["razon_social"] = rs_loc  # "ENERQUEN" (OCR) → "ENERQUEN S.A."
+        usados.append("emisor.razon_social")
     if campos.get("otros_tributos") is None and None not in (
             campos.get("importe_total"), campos.get("importe_neto"), campos.get("iva")):
         campos["otros_tributos"] = round(campos["importe_total"] - campos["importe_neto"] - campos["iva"], 2)
@@ -1201,6 +1220,12 @@ def procesar(pdf: bytes, nombre: str, modo: str, url: str, timeout: int, ocr: bo
         campos = parsear_campos(texto_parseo)
         _completar_montos_desde_capa_texto(campos, pdf, meta)
     campos = _normalizar_receptor(campos)
+
+    # Moneda por defecto: si el comprobante no la indica y no menciona moneda
+    # extranjera, se asume Pesos (una factura en otra moneda lo detallaría).
+    if not campos.get("moneda") and not re.search(
+            r"(?i)\b(d[oó]lar(es)?|usd|u\$s|us\$|euros?|eur)\b", texto):
+        campos["moneda"], campos["moneda_codigo"] = "Pesos", "ARS"
 
     salida = {"ok": True, "archivo": nombre}
     salida.update(campos)
