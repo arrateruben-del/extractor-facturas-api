@@ -910,6 +910,8 @@ def parsear_campos(texto: str) -> dict:
     if not res.get("moneda") and ("$" in texto or re.search(r"(?i)\bpesos\b", texto)):
         res["moneda"], res["moneda_codigo"] = "Pesos", "ARS"
 
+    _layout_subtotal_percepciones(texto, res)
+
     # Factura A inferida por contexto fiscal si no vino letra/código explícitos
     if res.get("clase") == "Factura" and not res.get("letra"):
         cond_emi = plegar(res.get("emisor", {}).get("condicion_iva") or "")
@@ -920,6 +922,130 @@ def parsear_campos(texto: str) -> dict:
             res["tipo_comprobante"] = "Factura A"
 
     return res
+
+
+_RE_HDR_TOT_PERC = re.compile(r"(?i)sub-?\s*total\s+iva\s*%\s+iva\s+percepciones\s+itc")
+_RE_NUM_AR = r"\d{1,3}(?:\.\d{3})*,\d{2}"
+_RE_ITEM_ALIC = re.compile(
+    r"^\s*[\d.,]+\s+\S+\s+(?P<desc>\(.*?)\s+(?P<pu>[\d.]+,\d{2})\s+(?P<ii>[\d.]+,\d+)\s+"
+    r"(?P<tasa>[\d.]+,\d{2})\s+(?P<alic>\d{1,2},\d{2})\s+(?P<precio>[\d.]+,\d{2})\s+"
+    r"(?P<sub>[\d.]+,\d{2})\s*$")
+
+
+def _layout_subtotal_percepciones(texto: str, res: dict) -> None:
+    """Layout tipo estación de servicio (ENERQUEN/Shell): totales en fila
+    'Sub-Total | IVA % | IVA | Percepciones | ITC Ley 23966x | Tasas | Tasa Vial | Total'
+    y bloques en columnas que el OCR desordena (valores antes que etiquetas)."""
+    if not _RE_HDR_TOT_PERC.search(texto):
+        return
+    lineas = [" ".join(l.split()) for l in texto.splitlines()]
+    no_vacias = [l for l in lineas if l]
+    emi, rec = res.setdefault("emisor", {}), res.setdefault("receptor", {})
+    cuit_rec = rec.get("cuit") or ""
+
+    # --- Razón social emisor: primera línea "nombre" del encabezado ---
+    if not emi.get("razon_social"):
+        for cand in no_vacias[:3]:
+            if re.fullmatch(r"[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ&.,' \-]{2,60}", cand) and not _RE_ETIQ.search(plegar(cand)):
+                emi["razon_social"] = cand
+                break
+
+    # --- Domicilio emisor: este layout no lo muestra visualmente (sólo logo) ---
+    emi["domicilio"] = None
+
+    # --- Condición IVA "RESPONSABLE" partida en dos renglones ---
+    hay_ri = bool(re.search(r"(?i)responsable\s*\n?\s*inscripto", texto))
+    for parte in (emi, rec):
+        if hay_ri and plegar(parte.get("condicion_iva") or "") in ("responsable", ""):
+            parte["condicion_iva"] = "RESPONSABLE INSCRIPTO"
+
+    # --- Ingresos Brutos / Inicio de actividades (valores arriba de las etiquetas) ---
+    idx_iibb = next((i for i, l in enumerate(lineas) if re.fullmatch(r"(?i)ingresos brutos", l)), None)
+    if not re.search(r"\d", emi.get("ingresos_brutos") or ""):
+        emi["ingresos_brutos"] = None
+    if idx_iibb is not None:
+        previas = [l for l in lineas[max(0, idx_iibb - 5):idx_iibb] if l]
+        if not emi.get("ingresos_brutos"):
+            iibb = next((l for l in reversed(previas) if re.fullmatch(r"\d{2}-?\d{8}-?\d|\d{3,}[\d\-./]{3,}", l)
+                         and not re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", l)), None)
+            emi["ingresos_brutos"] = iibb
+        if not emi.get("inicio_actividades"):
+            f = next((l for l in reversed(previas) if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", l)), None)
+            emi["inicio_actividades"] = norm_fecha(f) if f else None
+    m_ia = re.search(r"(?i)inicio actividades\s+(\d{1,2}/\d{1,2}/\d{4})", texto)
+    if m_ia and not emi.get("inicio_actividades"):
+        emi["inicio_actividades"] = norm_fecha(m_ia.group(1))
+
+    # --- Receptor: "<RAZON SOCIAL> CUIT: xx" + "731235 ..." + "NECOCHEA 7630 ..." ---
+    idx_rec = next((i for i, l in enumerate(lineas)
+                    if re.search(r"(?i)\bcuit\s*:", l) and cuit_rec and cuit_rec in l), None)
+    if idx_rec is not None:
+        rs = re.split(r"(?i)\s*\bcuit\s*:", lineas[idx_rec])[0].strip(" -")
+        if rs:
+            rec["razon_social"] = rs
+        sig = [l for l in lineas[idx_rec + 1:idx_rec + 6] if l]
+        if len(sig) >= 2:
+            calle = re.split(r"\s+\d{4}-\d{6,8}", sig[0])[0].strip(" -")
+            calle = re.sub(r"^(\d{2})(\d{4})$", r"\1 \2", calle)
+            m_loc = next((m for m in (re.match(r"([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ .]+?)(?=\s+\d|$)", s) for s in sig[1:4]) if m), None)
+            if calle and re.search(r"\d", calle) and m_loc:
+                rec["domicilio"] = f"{calle} - {m_loc.group(1).strip()}"
+
+    # --- Condición de venta / vencimiento de pago ---
+    m_cv = re.search(r"(?im)^\(\s*\d+\s*\)\s*(CTA\.?\s*CTE[^\n]*?|CONTADO[^\n]*?)(?:\s+vencimiento:.*)?$", texto)
+    if m_cv and not res.get("condicion_venta"):
+        res["condicion_venta"] = m_cv.group(1).strip()
+    m_vto = re.search(r"(?i)(?<!cae:\s)\bvencimiento:\s*(\d{1,2}/\d{1,2}/\d{4})", texto)
+    if m_vto and not res.get("fecha_vto_pago"):
+        res["fecha_vto_pago"] = (norm_fecha(m_vto.group(1)) or {}).get("iso")
+
+    # --- Fila de totales: se toma la más completa (el OCR suele truncarla) ---
+    mejor = []
+    for i, l in enumerate(lineas):
+        if _RE_HDR_TOT_PERC.search(l):
+            sig = next((x for x in lineas[i + 1:i + 3] if x), "")
+            nums = re.findall(_RE_NUM_AR, sig)
+            if len(nums) > len(mejor):
+                mejor = nums
+    if mejor:
+        if len(mejor) >= 8:  # incluye la columna "IVA %"
+            mejor = mejor[:1] + mejor[2:]
+        cols = ["sub", "iva", "perc", "itc", "tasas", "vial", "total"]
+        v = {c: (mejor[k] if k < len(mejor) else None) for k, c in enumerate(cols)}
+        p = {c: parse_monto(x) if x else None for c, x in v.items()}
+        res["importe_neto"], res["importe_neto_original"] = p["sub"], v["sub"]
+        res["iva"], res["iva_original"] = p["iva"], v["iva"]
+        res["importe_total"], res["importe_total_original"] = p["total"], v["total"]
+        res["otros_tributos_detalle"] = [{"I.T.C.": p["itc"], "Tasa Gas Oil": p["tasas"]}]
+        if None not in (p["total"], p["sub"], p["iva"]):
+            res["otros_tributos"] = round(p["total"] - p["sub"] - p["iva"], 2)
+        elif None not in (p["perc"], p["itc"], p["tasas"], p["vial"]):
+            res["otros_tributos"] = round(p["perc"] + p["itc"] + p["tasas"] + p["vial"], 2)
+        else:
+            res["otros_tributos"] = None
+
+    # --- IVA detalle por ítem: descripción + alícuota + subtotal ---
+    renglones, buf = [], None
+    for l in lineas:
+        if not l:
+            continue
+        l = re.sub(r"\s[—–]\s", " ", l)
+        if buf is not None and l.startswith("/"):
+            l = f"{buf} {l}"
+        buf = None
+        if _RE_ITEM_ALIC.match(l):
+            renglones.append(l)
+        elif re.match(r"^[\d.,]+\s+\S+\s+\(", l):
+            buf = l
+    detalle = []
+    for l in renglones:
+        m = _RE_ITEM_ALIC.match(l)
+        desc = re.sub(r"^\(\s*([A-Z]?\d+)\s*\)?\s*", r"(\1)", m.group("desc"))
+        desc = re.sub(r"\s+\d$", "", desc).strip(" /")
+        detalle.append({"descripcion": desc, "alicuota": parse_monto(m.group("alic")),
+                        "subtotal": parse_monto(m.group("sub")), "original": l})
+    if detalle:
+        res["iva_detalle"] = detalle
 
 
 def _completar(base: dict, extra: dict) -> dict:
@@ -967,6 +1093,47 @@ def _normalizar_receptor(campos: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 # 6. Orquestación
 # ═══════════════════════════════════════════════════════════════════════════
+
+_CAMPOS_MONTO = ("importe_neto", "importe_neto_original", "iva", "iva_original",
+                 "importe_total", "importe_total_original", "otros_tributos")
+
+
+def _completar_montos_desde_capa_texto(campos: dict, pdf: bytes, meta: dict) -> None:
+    """Si el OCR dejó montos en null pero el PDF tiene capa de texto (PDF digital
+    enviado con ocr=true), se completan SÓLO los montos desde esa capa."""
+    faltan = [k for k in _CAMPOS_MONTO if campos.get(k) is None]
+    det = campos.get("otros_tributos_detalle") or []
+    faltan_det = any(v is None for d in det for v in d.values())
+    if not faltan and not faltan_det:
+        return
+    try:
+        loc = extraer_local(pdf)
+    except Exception:
+        return
+    if not (loc.get("texto") or "").strip():
+        return
+    extra = parsear_campos(loc["texto"])
+    if loc.get("layout"):
+        extra = _completar(parsear_campos(loc["layout"]), extra)
+    usados = []
+    for k in faltan:
+        if extra.get(k) is not None:
+            campos[k] = extra[k]
+            usados.append(k)
+    det_loc = extra.get("otros_tributos_detalle") or []
+    if det and det_loc:
+        for d, dl in zip(det, det_loc):
+            for k, v in d.items():
+                if v is None and dl.get(k) is not None:
+                    d[k] = dl[k]
+                    usados.append(f"otros_tributos_detalle.{k}")
+    if campos.get("otros_tributos") is None and None not in (
+            campos.get("importe_total"), campos.get("importe_neto"), campos.get("iva")):
+        campos["otros_tributos"] = round(campos["importe_total"] - campos["importe_neto"] - campos["iva"], 2)
+        usados.append("otros_tributos")
+    if usados:
+        meta["advertencias"].append("Completado desde capa de texto del PDF: " + ", ".join(usados))
+
 
 def procesar(pdf: bytes, nombre: str, modo: str, url: str, timeout: int, ocr: bool,
              anonimizar: str | None, lang: str | None, pages: str | None) -> dict:
@@ -1029,8 +1196,10 @@ def procesar(pdf: bytes, nombre: str, modo: str, url: str, timeout: int, ocr: bo
     # completa con el texto lineal; en modo API sólo el texto de Escriba.
     if layout:
         campos = _completar(parsear_campos(layout), parsear_campos(texto))
+        _layout_subtotal_percepciones(layout, campos)  # re-aplica reglas del layout tras completar
     else:
         campos = parsear_campos(texto_parseo)
+        _completar_montos_desde_capa_texto(campos, pdf, meta)
     campos = _normalizar_receptor(campos)
 
     salida = {"ok": True, "archivo": nombre}
