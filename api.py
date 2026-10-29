@@ -3,9 +3,13 @@ import os
 import sys
 import json
 import hmac
+import uuid
 import subprocess
 import tempfile
+import urllib.request
+import urllib.error
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import Response
@@ -23,9 +27,67 @@ API_KEY = os.environ.get("EXTRACTOR_API_KEY", "")
 MAX_BYTES = 15 * 1024 * 1024
 
 
+ESCRIBA_URL = os.environ.get("ESCRIBA_URL", "").strip()
+ESCRIBA_API_KEY = os.environ.get("ESCRIBA_API_KEY", "").strip()
+
+
+def _validar_url(valor: str) -> dict:
+    """Valida que la URL tenga esquema http(s) y host. No es un ping."""
+    if not valor:
+        return {"ok": False, "detalle": "ESCRIBA_URL vacía"}
+    p = urlparse(valor)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return {"ok": False, "host": None,
+                "detalle": f"No es una URL con servidor (valor='{valor}'). "
+                           "Formato esperado: http://host:puerto"}
+    return {"ok": True, "host": p.hostname, "port": p.port, "scheme": p.scheme}
+
+
+def _probar_escriba_auth(timeout: int = 8) -> dict:
+    """Prueba REAL de conectividad + autenticación contra Escriba.
+    Nunca devuelve ni loguea el valor del token."""
+    val = _validar_url(ESCRIBA_URL)
+    if not val["ok"]:
+        return {"url_valida": False, **val, "auth": None}
+    if not ESCRIBA_API_KEY:
+        return {"url_valida": True, "host": val["host"],
+                "auth": "sin_api_key", "detalle": "ESCRIBA_API_KEY vacía"}
+    boundary = "----diag" + uuid.uuid4().hex
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; "
+            "name=\"file\"; filename=\"diag.pdf\"\r\n"
+            "Content-Type: application/pdf\r\n\r\n%PDF-1.4\r\n"
+            f"--{boundary}--\r\n").encode()
+    req = urllib.request.Request(
+        ESCRIBA_URL.rstrip("/") + "/api/convert", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                 "X-API-Key": ESCRIBA_API_KEY, "Accept": "application/json"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return {"url_valida": True, "host": val["host"],
+                    "auth": "ok", "http": r.status}
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return {"url_valida": True, "host": val["host"], "auth": "rechazada",
+                    "http": e.code,
+                    "detalle": "El token ESCRIBA_API_KEY no es válido (HTTP %d)" % e.code}
+        # Cualquier otro código (p.ej. 422 por el PDF dummy) = auth aceptada
+        return {"url_valida": True, "host": val["host"], "auth": "ok", "http": e.code}
+    except Exception as e:
+        return {"url_valida": True, "host": val["host"], "auth": "sin_conexion",
+                "detalle": f"Escriba no responde: {e}"}
+
+
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(deep: bool = False):
+    """Básico por defecto. Con ?deep=1 valida ESCRIBA_URL y prueba el token real."""
+    if not deep:
+        return {"status": "ok"}
+    escriba = _probar_escriba_auth()
+    sano = escriba.get("url_valida") and escriba.get("auth") == "ok"
+    return {"status": "ok" if sano else "degradado",
+            "extractor_api_key_configurada": bool(API_KEY),
+            "escriba": escriba}
 
 
 @app.post("/extraer-factura")
