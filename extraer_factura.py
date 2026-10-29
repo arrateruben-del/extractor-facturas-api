@@ -340,7 +340,34 @@ def _normalizar_condicion_iva(valor: str | None) -> str | None:
     v = " ".join(valor.strip().split())
     if re.fullmatch(r"[0-9.\- ]{4,}", v):
         return None
+    pv = plegar(v)
+    if "inscripto" in pv:
+        return "RESPONSABLE INSCRIPTO"
+    if "monotrib" in pv:
+        return "MONOTRIBUTO"
+    if "consumidor final" in pv:
+        return "CONSUMIDOR FINAL"
+    if "exento" in pv:
+        return "EXENTO"
+    if "no responsable" in pv:
+        return "NO RESPONSABLE"
     return v
+
+
+def _parece_domicilio_linea(linea: str) -> bool:
+    if not linea:
+        return False
+    l = " ".join(linea.strip().split())
+    if not l:
+        return False
+    if re.search(r"(?i)\b(cae|comprobante|importe|total|neto|iva|ctg|transporte|vencimiento|ingresos|cuit|cbu|cuenta|correo|e-mail)\b", l):
+        return False
+    return bool(
+        re.search(r"(?i)\b(calle|av\.?|avenida|ruta|pasaje|pje\.?|barrio|piso|depto|dpto)\b", l)
+        or re.search(r"\(\d{4}\)\s*[A-ZÁÉÍÓÚÑ ]{3,}", l)
+        or re.search(r"^\d{4}\s+[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ ]{2,}$", l)
+        or (re.search(r"\d", l) and re.search(r"[A-ZÁÉÍÓÚÑ]{3,}", l) and len(l) <= 80)
+    )
 
 
 def norm_id(valor: str | None) -> dict | None:
@@ -698,6 +725,80 @@ def parsear_campos(texto: str) -> dict:
                 if not res["emisor"].get("razon_social") or plegar(rs) != plegar(res["emisor"].get("razon_social") or ""):
                     res["receptor"]["razon_social"] = rs
                     break
+
+    lineas = [" ".join(ln.strip().split()) for ln in texto.splitlines() if ln.strip()]
+
+    if not res["emisor"].get("domicilio"):
+        for i, ln in enumerate(lineas[:14]):
+            if re.search(r"(?i)\bfactura\b", ln) and i + 1 < len(lineas):
+                cand = lineas[i + 1]
+                if _parece_domicilio_linea(cand):
+                    res["emisor"]["domicilio"] = cand
+                    break
+        if not res["emisor"].get("domicilio"):
+            for ln in lineas[:20]:
+                if _parece_domicilio_linea(ln):
+                    res["emisor"]["domicilio"] = ln
+                    break
+
+    if not res["receptor"].get("domicilio"):
+        rs_rec = res["receptor"].get("razon_social") or ""
+        if rs_rec:
+            prs = plegar(rs_rec)
+            for i, ln in enumerate(lineas):
+                if prs in plegar(ln):
+                    for cand in lineas[i + 1:i + 5]:
+                        cand2 = re.split(r"(?i)\bctrl\.?\s*n?°?", cand)[0].strip(" -—")
+                        if _parece_domicilio_linea(cand2):
+                            res["receptor"]["domicilio"] = cand2
+                            break
+                    if res["receptor"].get("domicilio"):
+                        break
+        if not res["receptor"].get("domicilio"):
+            for ln in lineas:
+                cand = re.split(r"(?i)\bctrl\.?\s*n?°?", ln)[0].strip(" -—")
+                if re.search(r"^\d{4}\s+[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ ]{2,}$", cand):
+                    res["receptor"]["domicilio"] = cand
+                    break
+
+    if not res["receptor"].get("condicion_iva"):
+        m_rec_cond = re.search(r"(?im)^(?:\d{2}[-\s.]?\d{4,8}[-\s.]?\d)\s+([^\n]{0,40}\b(?:inscripto|monotributo|exento|consumidor\s+final|no\s+responsable)\b)", texto)
+        if m_rec_cond:
+            res["receptor"]["condicion_iva"] = _normalizar_condicion_iva(m_rec_cond.group(1))
+        else:
+            for ln in lineas:
+                if re.search(r"(?i)\b(inscripto|monotributo|exento|consumidor\s+final|no\s+responsable)\b", ln):
+                    if len(re.sub(r"\D", "", ln)) >= 10:
+                        res["receptor"]["condicion_iva"] = _normalizar_condicion_iva(ln)
+                        break
+
+    if not res.get("condicion_venta"):
+        m_cv = re.search(r"(?im)condicion\s+de\s+(?:venta|pago)\s*:\s*([^\n]+)", texto)
+        if m_cv:
+            res["condicion_venta"] = " ".join(m_cv.group(1).split())
+
+    if not res.get("iva_detalle"):
+        alics = []
+        for m in re.finditer(r"(?i)importe\s+de\s+iva\s*(\d{1,2}(?:[.,]\d{1,2})?)", texto):
+            a = parse_monto(m.group(1))
+            if a is not None and 0 < a <= 100 and a not in alics:
+                alics.append(a)
+        if alics:
+            det = None
+            if res.get("importe_neto") is not None and res.get("iva") is not None:
+                mejor = min(alics, key=lambda a: abs((res["importe_neto"] * a / 100.0) - res["iva"]))
+                esperado = round(res["importe_neto"] * mejor / 100.0, 2)
+                if abs(esperado - res["iva"]) <= max(2.0, abs(res["iva"]) * 0.03):
+                    det = {"alicuota": mejor, "monto": res["iva"], "original": f"Importe de IVA {mejor:.2f}"}
+            if not det:
+                det = {"alicuota": alics[0], "monto": None, "original": f"Importe de IVA {alics[0]:.2f}"}
+            res["iva_detalle"] = [det]
+
+    if res.get("otros_tributos") is None:
+        neto_v, iva_v, tot_v = res.get("importe_neto"), res.get("iva"), res.get("importe_total")
+        if None not in (neto_v, iva_v, tot_v):
+            dif = round(tot_v - neto_v - iva_v, 2)
+            res["otros_tributos"] = 0.0 if abs(dif) < 0.01 else dif
 
     return res
 
