@@ -838,7 +838,11 @@ def parsear_campos(texto: str) -> dict:
 
     m_dom_rec = re.search(r"(?im)^domicilio\s*:\s*([^\n]+)", texto)
     if m_dom_rec:
-        res["receptor"]["domicilio"] = " ".join(m_dom_rec.group(1).split())
+        dom_rec = " ".join(m_dom_rec.group(1).split())
+        m_postal = re.match(r"^(\d{2})\s*(\d{3,4})\s+(\d{4}\s+[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ ]+)$", dom_rec, re.I)
+        if m_postal:
+            dom_rec = f"{m_postal.group(1)} {m_postal.group(2)} - {m_postal.group(3)}"
+        res["receptor"]["domicilio"] = dom_rec
 
     m_cond_rec = re.search(r"(?im)^condici[oó]n\s*iva\s*:\s*([^\n]*?)\s+cuit\s*:", texto)
     if m_cond_rec:
