@@ -302,6 +302,10 @@ _RE_CUIT = re.compile(r"(?<!\d)(20|23|24|25|26|27|30|33|34)[-\s.]?(\d{8})[-\s.]?
 _RE_FECHA = re.compile(r"(?<!\d)(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4}|\d{2})(?!\d)")
 _RE_FECHA_ISO = re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
 _RE_MONTO = re.compile(r"-?\d[\d.,]*\d|-?\d")
+_RE_COND_IVA_TXT = re.compile(
+    r"(?i)\b(responsable inscripto|responsable monotributo|monotributo|"
+    r"exento|consumidor final|no responsable)\b"
+)
 
 
 def cuit_valido(digitos: str) -> bool:
@@ -312,6 +316,31 @@ def cuit_valido(digitos: str) -> bool:
     dv = 11 - sum(int(a) * b for a, b in zip(digitos, pesos)) % 11
     dv = {11: 0, 10: 9}.get(dv, dv)
     return dv == int(digitos[10])
+
+
+def extraer_cuits_relajados(texto: str) -> list[str]:
+    """Extrae CUITs tolerando OCR con separadores/espacios intermedios."""
+    out: list[str] = []
+    for m in re.finditer(r"(?<!\d)(20|23|24|25|26|27|30|33|34)(?!\d)", texto):
+        tramo = texto[m.start():m.start() + 26]
+        dig = re.sub(r"\D", "", tramo)
+        if len(dig) < 11:
+            continue
+        cand = dig[:11]
+        if not cand.startswith(m.group(1)):
+            continue
+        if cand not in out and cuit_valido(cand):
+            out.append(cand)
+    return out
+
+
+def _normalizar_condicion_iva(valor: str | None) -> str | None:
+    if not valor:
+        return None
+    v = " ".join(valor.strip().split())
+    if re.fullmatch(r"[0-9.\- ]{4,}", v):
+        return None
+    return v
 
 
 def norm_id(valor: str | None) -> dict | None:
@@ -482,12 +511,23 @@ def parsear_campos(texto: str) -> dict:
         # (misma línea primero, luego hasta 4 renglones antes o 8 después)
         cand = [r for r in ids if -4 <= r["linea"] - corte <= 8]
         if cand:
-            id_rec = min(cand, key=lambda r: (abs(r["linea"] - corte), r["linea"] < corte))
+            id_rec = min(
+                cand,
+                key=lambda r: (
+                    0 if r["clave"] in ("cuit", "cuil") else 1,
+                    abs(r["linea"] - corte),
+                    r["linea"] < corte,
+                ),
+            )
     elif len(ids) > 1:
-        id_rec = ids[1]
+        ids_cuit = [r for r in ids if r["clave"] in ("cuit", "cuil")]
+        id_rec = ids_cuit[1] if len(ids_cuit) > 1 else ids[1]
     id_emi = next((r for r in ids if r is not id_rec), None)
     # Fallback por regex si faltan etiquetas: 1º CUIT = emisor, otro distinto = receptor
     cuits_txt = ["".join(m.groups()) for m in _RE_CUIT.finditer(texto)]
+    for c in extraer_cuits_relajados(texto):
+        if c not in cuits_txt:
+            cuits_txt.append(c)
     emisor_id = norm_id(id_emi["valor"]) if id_emi else (norm_id(cuits_txt[0]) if cuits_txt else None)
     receptor_id = norm_id(id_rec["valor"]) if id_rec else None
     if receptor_id is None and emisor_id:
@@ -501,7 +541,7 @@ def parsear_campos(texto: str) -> dict:
         "cuit": emisor_id["numero"] if emisor_id and emisor_id["numero"] else val(id_emi),
         "cuit_valido": emisor_id["valido"] if emisor_id else None,
         "domicilio": val(_primero(regs, "domicilio", cab)),
-        "condicion_iva": val(_primero(regs, "cond_iva", cab)),
+        "condicion_iva": _normalizar_condicion_iva(val(_primero(regs, "cond_iva", cab))),
         "ingresos_brutos": val(_primero(regs, "ingresos_brutos")),
         "inicio_actividades": norm_fecha(val(_primero(regs, "inicio_act"))),
     }
@@ -514,7 +554,7 @@ def parsear_campos(texto: str) -> dict:
         "tipo_documento": receptor_id["tipo"] if receptor_id else None,
         "cuit_valido": receptor_id["valido"] if receptor_id and not es_dni else None,
         "domicilio": val(_primero(regs, "domicilio", cuerpo)),
-        "condicion_iva": val(_primero(regs, "cond_iva", cuerpo)),
+        "condicion_iva": _normalizar_condicion_iva(val(_primero(regs, "cond_iva", cuerpo))),
     }
     res["condicion_venta"] = val(_primero(regs, "cond_venta"))
 
@@ -534,6 +574,9 @@ def parsear_campos(texto: str) -> dict:
         m = re.search(r"punto de venta:?\s*comp\.?\s?nro:?\s*(\d{1,5})\s+(\d{1,8})", pl)
         if m:
             pv, nro = pv or m.group(1), nro or m.group(2)
+    m = re.search(r"factura\s*n(?:ro|°|o)\.?\s*(\d{1,5})\s+(\d{1,8})", pl)
+    if m:
+        pv, nro = m.group(1), m.group(2)
     res["punto_venta"] = pv
     res["numero_comprobante"] = nro
     res["comprobante"] = (f"{int(pv):04d}-{int(nro):08d}" if pv and nro else None)
@@ -546,6 +589,19 @@ def parsear_campos(texto: str) -> dict:
     res["periodo_desde"] = (norm_fecha(val(_primero(regs, "periodo_desde"))) or {}).get("iso")
     res["periodo_hasta"] = (norm_fecha(val(_primero(regs, "periodo_hasta"))) or {}).get("iso")
     res["fecha_vto_pago"] = (norm_fecha(val(_primero(regs, "fecha_vto_pago"))) or {}).get("iso")
+    if not res["fecha_emision"]:
+        for ln in texto.splitlines()[:25]:
+            if re.search(r"(?i)venc|cae|porte|transporte|ctg", ln):
+                continue
+            nf = norm_fecha(ln)
+            if nf and nf.get("iso"):
+                res["fecha_emision"] = nf["iso"]
+                res["fecha_emision_original"] = nf["original"]
+                break
+    if not res["fecha_vto_pago"]:
+        m = re.search(r"(?i)vencimiento(?:\s+el)?\s+(\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4})", texto)
+        if m:
+            res["fecha_vto_pago"] = (norm_fecha(m.group(1)) or {}).get("iso")
 
     # --- CAE ---
     r_cae = _primero(regs, "cae", lambda r: bool(re.search(r"\d{14}", r["valor"])))
@@ -576,7 +632,8 @@ def parsear_campos(texto: str) -> dict:
     for d in detalle:
         if d["alicuota"] not in vistos:
             vistos.add(d["alicuota"]); iva_det.append(d)
-    iva_tot = monto(val(_primero(regs, "iva_total", es_num)))
+    iva_cands = [r for r in regs if r["clave"] == "iva_total" and es_num(r)]
+    iva_tot = monto(max(iva_cands, key=lambda r: parse_monto(r["valor"]) or 0)["valor"]) if iva_cands else None
     if iva_tot and iva_tot["valor"] is not None:
         res["iva"], res["iva_original"] = iva_tot["valor"], iva_tot["original"]
     elif iva_det:
@@ -602,8 +659,35 @@ def parsear_campos(texto: str) -> dict:
             cod_mon = "USD"
         elif re.search(r"(?<![a-z])(eur|euro)", pm):
             cod_mon = "EUR"
+    if not mon and re.search(r"(?i)\bson\s+pesos\b|\bpesos\b", texto):
+        mon, cod_mon = "Pesos", "ARS"
     res["moneda"] = mon
     res["moneda_codigo"] = cod_mon
+
+    if not res["emisor"].get("condicion_iva"):
+        m_cond = _RE_COND_IVA_TXT.search(texto)
+        if m_cond:
+            res["emisor"]["condicion_iva"] = m_cond.group(1).upper()
+
+    if not res["emisor"].get("razon_social"):
+        m = re.search(r"(?im)^\s*de\s+([^\n]{4,80}?)\s+[A-Z]\s+\d+\s+FACTURA\b", texto)
+        if m:
+            res["emisor"]["razon_social"] = " ".join(m.group(1).split())
+
+    if not res["receptor"].get("razon_social"):
+        for ln in texto.splitlines():
+            l = ln.strip()
+            if not l:
+                continue
+            if re.search(r"(?i)^(señor\(es\):|condicion|cuenta|asiento|ctrl\.?|domicilio|localidad|cuit|ingresos|inicio|factura|comprobante|cae|vencimiento|importe|total|neto|iva|ctg|transporte|proced|destino|carga|km|kilos|tarifa|correo|e-mail)", l):
+                continue
+            m = re.search(r"\b([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9&'.,\- ]{2,}?(?:S\.?\s*A\.?|S\.?\s*R\.?\s*L\.?|S\.?\s*A\.?\s*S\.?|S\.?\s*C\.?\s*A\.?))\b", l)
+            if m:
+                rs = " ".join(m.group(1).split())
+                if not res["emisor"].get("razon_social") or plegar(rs) != plegar(res["emisor"].get("razon_social") or ""):
+                    res["receptor"]["razon_social"] = rs
+                    break
+
     return res
 
 
@@ -615,6 +699,19 @@ def _completar(base: dict, extra: dict) -> dict:
         elif base.get(k) in (None, "", []) and v not in (None, "", []):
             base[k] = v
     return base
+
+
+def _normalizar_receptor(campos: dict) -> dict:
+    rec = campos.get("receptor")
+    if not isinstance(rec, dict):
+        return campos
+    tipo = (rec.get("tipo_documento") or "").upper()
+    if tipo != "DNI":
+        rec["dni"] = None
+    if tipo == "DNI":
+        rec["cuit"] = None
+        rec["cuit_valido"] = None
+    return campos
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -684,6 +781,7 @@ def procesar(pdf: bytes, nombre: str, modo: str, url: str, timeout: int, ocr: bo
         campos = _completar(parsear_campos(layout), parsear_campos(texto))
     else:
         campos = parsear_campos(texto_parseo)
+    campos = _normalizar_receptor(campos)
 
     salida = {"ok": True, "archivo": nombre}
     salida.update(campos)
