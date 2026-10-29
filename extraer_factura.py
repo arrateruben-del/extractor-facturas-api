@@ -360,7 +360,7 @@ def _parece_domicilio_linea(linea: str) -> bool:
     l = " ".join(linea.strip().split())
     if not l:
         return False
-    if re.search(r"(?i)\b(cae|comprobante|importe|total|neto|iva|ctg|transporte|vencimiento|ingresos|cuit|cbu|cuenta|correo|e-mail)\b", l):
+    if re.search(r"(?i)\b(cae|comprobante|importe|total|neto|iva|ctg|transporte|vencimiento|ingresos|cuit|cbu|cuenta|correo|e-mail|asiento|emp\b)\b", l):
         return False
     return bool(
         re.search(r"(?i)\b(calle|av\.?|avenida|ruta|pasaje|pje\.?|barrio|piso|depto|dpto)\b", l)
@@ -747,6 +747,20 @@ def parsear_campos(texto: str) -> dict:
             prs = plegar(rs_rec)
             for i, ln in enumerate(lineas):
                 if prs in plegar(ln):
+                    # Caso OCR típico: "731235 Asiento..." + "7630 NECOCHEA ..." -> "73 1235 - 7630 NECOCHEA"
+                    for j in range(i + 1, min(i + 6, len(lineas) - 1)):
+                        m_calle = re.search(r"\b(\d{6})\b", lineas[j])
+                        if not m_calle:
+                            continue
+                        prox = re.split(r"(?i)\bctrl\.?\s*n?°?", lineas[j + 1])[0].strip(" -—")
+                        m_loc = re.search(r"\b(\d{4}\s+[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ ]{2,})\b", prox)
+                        if m_loc:
+                            num = m_calle.group(1)
+                            res["receptor"]["domicilio"] = f"{num[:2]} {num[2:]} - {m_loc.group(1)}"
+                            break
+                    if res["receptor"].get("domicilio"):
+                        break
+
                     for cand in lineas[i + 1:i + 5]:
                         cand2 = re.split(r"(?i)\bctrl\.?\s*n?°?", cand)[0].strip(" -—")
                         if _parece_domicilio_linea(cand2):
