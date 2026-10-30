@@ -248,6 +248,18 @@ def _limpiar_valor(v: str) -> str:
     return "" if v in ("$", "-", "–") else v
 
 
+_RE_COL_TABLA = re.compile(
+    r"\b(?:cantidad|cant\.|precio unit|p\. ?unit|% ?bonif|bonif\.?|u\. ?medida|"
+    r"producto ?/ ?servicio|descripcion|codigo|subtotal c/ ?iva|alicuota)\b")
+_RE_MONTO_PURO = re.compile(r"\$?\s*-?\d{1,3}(?:[.,\s]?\d{3})*(?:[.,]\d{1,2})?|\$?\s*-?\d+(?:[.,]\d{1,2})?")
+
+
+def es_monto_puro(valor: str | None) -> bool:
+    """True si el valor es sólo un importe ("$ 2439348,28", "2.439.348,28"),
+    no un renglón de ítem con varios números."""
+    return bool(valor) and bool(_RE_MONTO_PURO.fullmatch(valor.strip()))
+
+
 def escanear_etiquetas(texto: str) -> list[dict]:
     """Recorre el texto línea a línea y asocia cada etiqueta con su valor:
       * mismo renglón: lo que sigue a la etiqueta hasta la próxima etiqueta o
@@ -260,6 +272,11 @@ def escanear_etiquetas(texto: str) -> list[dict]:
         if not linea.strip():
             continue
         pl = plegar(linea)
+        # Encabezado de la tabla de ítems ("Cantidad ... Precio Unit. ... Subtotal IVA ..."):
+        # no son etiquetas de totales; si se tomaran, el valor sería el primer ítem.
+        if len(_RE_COL_TABLA.findall(pl)) >= 3:
+            pendientes = []
+            continue
         matches = list(_RE_ETIQ.finditer(pl))
         if not matches:
             if pendientes:
@@ -280,6 +297,15 @@ def escanear_etiquetas(texto: str) -> list[dict]:
             if "\t" in crudo.strip(" :$"):     # cortar en salto de columna
                 crudo = crudo.lstrip(" :$\t").split("\t")[0]
             valor = _limpiar_valor(crudo)
+            # "Condición frente al IVA: IVA Responsable Inscripto": la condición se
+            # reconoce como otra etiqueta cond_iva; su propio texto es el valor.
+            if m.lastgroup == "cond_iva" and not valor:
+                sig = matches[i + 1] if i + 1 < len(matches) else None
+                txt_cond = _RE_COND_IVA_TXT.search(linea[m.start():m.end()])
+                if txt_cond:
+                    valor = txt_cond.group(1)
+                elif sig is not None and sig.lastgroup == "cond_iva" and sig.start() - m.end() <= 3:
+                    continue  # la condición viene en la etiqueta siguiente
             r = {"clave": m.lastgroup, "etiqueta": linea[m.start():m.end()],
                  "valor": valor or None, "linea": nl, "linea_valor": nl}
             regs.append(r)
@@ -655,7 +681,15 @@ def parsear_campos(texto: str) -> dict:
     res["fecha_vencimiento_cae_original"] = fv["original"] if fv else None
 
     # --- Importes (sólo valores que parsean como número) ---
-    es_num = lambda r: parse_monto(r["valor"]) is not None
+    es_num_libre = lambda r: parse_monto(r["valor"]) is not None
+    # Para importes se prefiere un valor que sea SÓLO un monto; si ninguna
+    # etiqueta lo tiene, se acepta cualquier valor numérico (comportamiento previo).
+    def es_num(r):
+        if not es_num_libre(r):
+            return False
+        if es_monto_puro(r["valor"]):
+            return True
+        return not any(x["clave"] == r["clave"] and es_monto_puro(x["valor"]) for x in regs)
     neto = monto(val(_primero(regs, "neto", es_num)))
     res["importe_neto"] = neto["valor"] if neto else None
     res["importe_neto_original"] = neto["original"] if neto else None
@@ -672,7 +706,10 @@ def parsear_campos(texto: str) -> dict:
     for d in detalle:
         if d["alicuota"] not in vistos:
             vistos.add(d["alicuota"]); iva_det.append(d)
-    iva_cands = [r for r in regs if r["clave"] == "iva_total" and es_num(r)]
+    # Prioridad: IVA total con monto puro > suma del detalle por alícuota > valor libre
+    iva_cands = [r for r in regs if r["clave"] == "iva_total" and es_num_libre(r) and es_monto_puro(r["valor"])]
+    if not iva_cands and not any(d["monto"] for d in iva_det):
+        iva_cands = [r for r in regs if r["clave"] == "iva_total" and es_num_libre(r)]
     iva_tot = monto(max(iva_cands, key=lambda r: parse_monto(r["valor"]) or 0)["valor"]) if iva_cands else None
     if iva_tot and iva_tot["valor"] is not None:
         res["iva"], res["iva_original"] = iva_tot["valor"], iva_tot["original"]
