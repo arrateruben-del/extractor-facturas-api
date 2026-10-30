@@ -947,6 +947,7 @@ def parsear_campos(texto: str) -> dict:
     if not res.get("moneda") and ("$" in texto or re.search(r"(?i)\bpesos\b", texto)):
         res["moneda"], res["moneda_codigo"] = "Pesos", "ARS"
 
+    _layout_agilgestion_arca(texto, res)
     _layout_subtotal_percepciones(texto, res)
 
     # Factura A inferida por contexto fiscal si no vino letra/código explícitos
@@ -959,6 +960,71 @@ def parsear_campos(texto: str) -> dict:
             res["tipo_comprobante"] = "Factura A"
 
     return res
+
+
+def _layout_agilgestion_arca(texto: str, res: dict) -> None:
+    """Factura ARCA generada por agilgestion (bloques Nombre/Domicilio y tabla %IVA)."""
+    if "agilgestion.com.ar" not in texto.lower():
+        return
+    emi, rec = res.setdefault("emisor", {}), res.setdefault("receptor", {})
+
+    # Bloque emisor apilado: C.U.I.T / Insc. Ing. Brutos / Inicio Actividades
+    m_bloq = re.search(
+        r"(?is)c\.?u\.?i\.?t\s*:?[ \t]*\n[ \t]*insc\.?\s*ing\.?\s*brutos\s*:?[ \t]*\n"
+        r"[ \t]*inicio\s+actividades\s*:?[ \t]*\n[ \t]*([^\n]+)\n[ \t]*([^\n]+)\n[ \t]*([^\n]+)",
+        texto,
+    )
+    if m_bloq and (not emi.get("cuit_valido")):
+        cuit_raw, iibb_raw, ini_raw = (" ".join(x.split()) for x in m_bloq.groups())
+        cuit_n = norm_id(cuit_raw)
+        if cuit_n and cuit_n.get("numero"):
+            emi["cuit"] = cuit_n["numero"]
+            emi["cuit_valido"] = cuit_n.get("valido")
+        # Sólo pisar IIBB si luce CUIT/CUIL (evita tomar nro de comprobante por OCR)
+        iibb_n = norm_id(iibb_raw)
+        if iibb_n and iibb_n.get("numero"):
+            emi["ingresos_brutos"] = iibb_n["numero"]
+        ini = norm_fecha(ini_raw)
+        if ini:
+            emi["inicio_actividades"] = ini
+
+    # Bloque receptor explícito: Nombre + Domicilio
+    m_nom = re.search(r"(?is)^\s*nombre\s*:\s*\n\s*([^\n]+)", texto, re.M)
+    if m_nom:
+        nom = " ".join(m_nom.group(1).split())
+        if nom and ":" not in nom and not re.fullmatch(r"(?i)domicilio\.?", nom):
+            rec["razon_social"] = nom
+    m_dom = re.search(r"(?is)^\s*nombre\s*:\s*\n\s*[^\n]+\n\s*domicilio\s*:\s*([^\n]+)", texto, re.M)
+    if m_dom:
+        rec["domicilio"] = " ".join(m_dom.group(1).split())
+
+    # IVA detalle por alícuota desde la tabla de ítems (%IVA)
+    if not res.get("iva_detalle"):
+        m_tab = re.search(r"(?is)c[oó]digo\s+producto\s*/\s*servicio.*?\n(.*?)\n\s*detalle\s*%\s*alic", texto)
+        tramo = m_tab.group(1) if m_tab else texto
+        alics = {}
+        for ln in tramo.splitlines():
+            l = " ".join(ln.split())
+            if not l:
+                continue
+            # fila de item: suele empezar con código y contener varios montos
+            if not re.match(r"^\d{4,}\b", l):
+                continue
+            nums = re.findall(r"\d{1,3}(?:\.\d{3})*,\d{2}", l)
+            if len(nums) < 4:
+                continue
+            # En este layout el %IVA es el penúltimo número del renglón de item
+            a = parse_monto(nums[-2])
+            if a is None or not (0 < a <= 100):
+                continue
+            alics[a] = alics.get(a, 0) + 1
+        if alics and res.get("iva") is not None:
+            mejor = max(alics.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            res["iva_detalle"] = [{
+                "alicuota": mejor,
+                "monto": res["iva"],
+                "original": f"%IVA {mejor:.2f}",
+            }]
 
 
 _RE_HDR_TOT_PERC = re.compile(r"(?i)sub-?\s*total\s+iva\s*%\s+iva\s+percepciones\s+itc")
@@ -1126,12 +1192,17 @@ _CAMPOS_MONTO = ("importe_neto", "importe_neto_original", "iva", "iva_original",
 
 
 def _completar_montos_desde_capa_texto(campos: dict, pdf: bytes, meta: dict) -> None:
-    """Si el OCR dejó montos en null pero el PDF tiene capa de texto (PDF digital
-    enviado con ocr=true), se completan SÓLO los montos desde esa capa."""
+    """Cuando se usa OCR sobre un PDF digital, completa datos desde la capa de texto
+    local (montos + identidad fiscal que el OCR puede romper)."""
     faltan = [k for k in _CAMPOS_MONTO if campos.get(k) is None]
     det = campos.get("otros_tributos_detalle") or []
     faltan_det = any(v is None for d in det for v in d.values())
-    if not faltan and not faltan_det:
+    emi = campos.get("emisor") or {}
+    needs_id = (not emi.get("cuit_valido")) or not re.fullmatch(r"\d{2}-\d{8}-\d", str(emi.get("cuit") or ""))
+    needs_iibb = (not emi.get("ingresos_brutos") or
+                  not re.search(r"\d{11}", re.sub(r"\D", "", str(emi.get("ingresos_brutos") or ""))))
+    needs_iva_det = not campos.get("iva_detalle")
+    if not (faltan or faltan_det or needs_id or needs_iibb or needs_iva_det):
         return
     try:
         loc = extraer_local(pdf)
@@ -1154,6 +1225,9 @@ def _completar_montos_desde_capa_texto(campos: dict, pdf: bytes, meta: dict) -> 
                 if v is None and dl.get(k) is not None:
                     d[k] = dl[k]
                     usados.append(f"otros_tributos_detalle.{k}")
+    if not campos.get("iva_detalle") and extra.get("iva_detalle"):
+        campos["iva_detalle"] = extra["iva_detalle"]
+        usados.append("iva_detalle")
     # Datos que el PDF trae en la capa de texto pero no son visibles para el OCR
     emi, emi_loc = campos.setdefault("emisor", {}), extra.get("emisor") or {}
     if not emi.get("domicilio") and emi_loc.get("domicilio") and \
@@ -1164,6 +1238,20 @@ def _completar_montos_desde_capa_texto(campos: dict, pdf: bytes, meta: dict) -> 
     if rs and rs_loc and rs_loc != rs and plegar(rs_loc).startswith(plegar(rs)):
         emi["razon_social"] = rs_loc  # "ENERQUEN" (OCR) → "ENERQUEN S.A."
         usados.append("emisor.razon_social")
+
+    # También completar identidad fiscal (OCR suele romper CUIT/IIBB en layouts ARCA)
+    id_bad = (not emi.get("cuit_valido")) or not re.fullmatch(r"\d{2}-\d{8}-\d", str(emi.get("cuit") or ""))
+    if id_bad and (emi_loc.get("cuit") and emi_loc.get("cuit_valido") is True):
+        emi["cuit"] = emi_loc["cuit"]
+        emi["cuit_valido"] = True
+        usados.append("emisor.cuit")
+    if (not emi.get("ingresos_brutos") or not re.search(r"\d{11}", re.sub(r"\D", "", str(emi.get("ingresos_brutos") or "")))) and emi_loc.get("ingresos_brutos"):
+        emi["ingresos_brutos"] = emi_loc["ingresos_brutos"]
+        usados.append("emisor.ingresos_brutos")
+    if not emi.get("inicio_actividades") and emi_loc.get("inicio_actividades"):
+        emi["inicio_actividades"] = emi_loc["inicio_actividades"]
+        usados.append("emisor.inicio_actividades")
+
     if campos.get("otros_tributos") is None and None not in (
             campos.get("importe_total"), campos.get("importe_neto"), campos.get("iva")):
         campos["otros_tributos"] = round(campos["importe_total"] - campos["importe_neto"] - campos["iva"], 2)
