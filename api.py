@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 
 app = FastAPI(
     title="API Extractor de Facturas",
@@ -306,24 +306,33 @@ async def pdf_a_imagen(
                         },
                     )
 
-                import io
-                import zipfile
-                buffer = io.BytesIO()
-                with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                    ancho_idx = len(str(documento.page_count))
-                    for i in range(documento.page_count):
-                        pixmap = _render_pixmap(pymupdf, documento[i], dpi)
-                        datos = _pixmap_a_bytes(pixmap, formato, calidad)
-                        nombre = f"{base}_p{str(i + 1).zfill(ancho_idx)}.{ext}"
-                        zf.writestr(nombre, datos)
-                buffer.seek(0)
-                return Response(
-                    content=buffer.getvalue(),
-                    media_type="application/zip",
-                    headers={
-                        "Cache-Control": "no-store",
-                        "Content-Disposition": f'attachment; filename="{base}_{ext}.zip"',
+                # Varias paginas: se devuelve JSON con un array de imagenes en
+                # base64 (una por pagina), pensado para consumirse en n8n
+                # (Split Out -> binario -> OpenAI Vision). No se usa ZIP.
+                import base64
+                ancho_idx = len(str(documento.page_count))
+                imagenes = []
+                for i in range(documento.page_count):
+                    pixmap = _render_pixmap(pymupdf, documento[i], dpi)
+                    datos = _pixmap_a_bytes(pixmap, formato, calidad)
+                    nombre = f"{base}_p{str(i + 1).zfill(ancho_idx)}.{ext}"
+                    b64 = base64.b64encode(datos).decode("ascii")
+                    imagenes.append({
+                        "pagina": i + 1,
+                        "nombre": nombre,
+                        "mime": media,
+                        "base64": b64,
+                        "data_url": f"data:{media};base64,{b64}",
+                    })
+                return JSONResponse(
+                    content={
+                        "ok": True,
+                        "formato": formato,
+                        "dpi": dpi,
+                        "paginas": documento.page_count,
+                        "imagenes": imagenes,
                     },
+                    headers={"Cache-Control": "no-store"},
                 )
         except HTTPException:
             raise
