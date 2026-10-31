@@ -191,20 +191,79 @@ async def extraer_factura(
             os.remove(ruta)
 
 
+def _render_pixmap(pymupdf, pagina, dpi: int):
+    """Renderiza una pagina a pixmap RGB a los DPI pedidos, acotando el tamano
+    a <= 8 MP y a 2400x3000 px para no agotar memoria con PDFs grandes."""
+    ancho = float(pagina.rect.width)
+    alto = float(pagina.rect.height)
+    if ancho <= 0 or alto <= 0:
+        raise HTTPException(status_code=422, detail="Pagina PDF sin dimensiones validas")
+    escala = dpi / 72.0
+    escala = min(escala, 2400 / ancho, 3000 / alto, (8_000_000 / (ancho * alto)) ** 0.5)
+    escala = max(escala, 0.1)
+    return pagina.get_pixmap(
+        matrix=pymupdf.Matrix(escala, escala),
+        colorspace=pymupdf.csRGB,
+        alpha=False,
+    )
+
+
+def _pixmap_a_bytes(pixmap, formato: str, calidad: int) -> bytes:
+    if formato == "png":
+        return pixmap.tobytes("png")
+    return pixmap.tobytes("jpg", jpg_quality=calidad)
+
+
 @app.post("/pdf-a-imagen")
 async def pdf_a_imagen(
     file: UploadFile = File(...),
+    formato: str = Form(default="png"),
+    paginas: str = Form(default="1"),
+    dpi: int = Form(default=150),
+    calidad: int = Form(default=90),
     x_api_key: str | None = Header(default=None),
 ):
-    """Devuelve la primera pagina del PDF como PNG para lectura visual en n8n.
+    """Convierte un PDF en imagenes JPG o PNG.
 
-    Autenticacion y limite de tamano compatibles con /extraer-factura.
+    Parametros (form-data):
+      - file: PDF a convertir (obligatorio).
+      - formato: 'png' (por defecto) o 'jpg'.
+      - paginas: '1' (por defecto) o cualquier numero de pagina (1-based); o
+        'todas'/'all' para convertir todas las paginas.
+      - dpi: resolucion de salida (72-300, por defecto 150).
+      - calidad: calidad JPG 1-100 (por defecto 90; se ignora en PNG).
+
+    Devuelve una sola imagen cuando se pide una pagina, o un ZIP
+    (una imagen por pagina) cuando se piden todas. Autenticacion y limite de
+    tamano compatibles con /extraer-factura.
     """
     if not API_KEY or not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
         raise HTTPException(status_code=401, detail="API Key invalida")
 
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Solo se aceptan archivos PDF")
+
+    formato = (formato or "png").strip().lower()
+    if formato in ("jpeg",):
+        formato = "jpg"
+    if formato not in ("png", "jpg"):
+        raise HTTPException(status_code=400, detail="formato debe ser 'png' o 'jpg'")
+
+    dpi = max(72, min(int(dpi), 300))
+    calidad = max(1, min(int(calidad), 100))
+    sel = (paginas or "1").strip().lower()
+    todas = sel in ("todas", "all", "*")
+    if not todas:
+        if not sel.isdigit() or int(sel) < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="paginas debe ser un numero >= 1 o 'todas'",
+            )
+        n_pagina = int(sel)
+
+    ext = "png" if formato == "png" else "jpg"
+    media = "image/png" if formato == "png" else "image/jpeg"
+    base = Path(file.filename or "pdf").stem or "pagina"
 
     try:
         contenido = bytearray()
@@ -228,31 +287,48 @@ async def pdf_a_imagen(
                 if documento.needs_pass:
                     raise HTTPException(status_code=422, detail="El PDF tiene contrasena")
 
-                pagina = documento[0]
-                ancho = float(pagina.rect.width)
-                alto = float(pagina.rect.height)
-                if ancho <= 0 or alto <= 0:
-                    raise HTTPException(status_code=422, detail="Pagina PDF sin dimensiones validas")
+                if not todas:
+                    if n_pagina > documento.page_count:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=f"El PDF tiene {documento.page_count} pagina(s); "
+                                   f"se pidio la {n_pagina}",
+                        )
+                    pixmap = _render_pixmap(pymupdf, documento[n_pagina - 1], dpi)
+                    datos = _pixmap_a_bytes(pixmap, formato, calidad)
+                    return Response(
+                        content=datos,
+                        media_type=media,
+                        headers={
+                            "Cache-Control": "no-store",
+                            "Content-Disposition":
+                                f'inline; filename="{base}_p{n_pagina}.{ext}"',
+                        },
+                    )
 
-                # Se busca ~2x de resolucion sin superar dimensiones ni 8 MP.
-                escala = min(2.0, 2400 / ancho, 3000 / alto,
-                             (8_000_000 / (ancho * alto)) ** 0.5)
-                imagen = pagina.get_pixmap(
-                    matrix=pymupdf.Matrix(escala, escala),
-                    colorspace=pymupdf.csRGB,
-                    alpha=False,
+                import io
+                import zipfile
+                buffer = io.BytesIO()
+                with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    ancho_idx = len(str(documento.page_count))
+                    for i in range(documento.page_count):
+                        pixmap = _render_pixmap(pymupdf, documento[i], dpi)
+                        datos = _pixmap_a_bytes(pixmap, formato, calidad)
+                        nombre = f"{base}_p{str(i + 1).zfill(ancho_idx)}.{ext}"
+                        zf.writestr(nombre, datos)
+                buffer.seek(0)
+                return Response(
+                    content=buffer.getvalue(),
+                    media_type="application/zip",
+                    headers={
+                        "Cache-Control": "no-store",
+                        "Content-Disposition": f'attachment; filename="{base}_{ext}.zip"',
+                    },
                 )
-                png = imagen.tobytes("png")
         except HTTPException:
             raise
         except Exception as exc:
             # No exponer detalles del PDF ni rutas internas al cliente.
             raise HTTPException(status_code=422, detail="No se pudo convertir el PDF a imagen") from exc
-
-        return Response(
-            content=png,
-            media_type="image/png",
-            headers={"Cache-Control": "no-store"},
-        )
     finally:
         await file.close()
